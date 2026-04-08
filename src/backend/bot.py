@@ -1,9 +1,14 @@
 import json
 import logging
 import requests
+import time
+import uuid
 from openai import OpenAI
 from datetime import datetime
-import uuid
+from solders.keypair import Keypair
+
+# Pacifica common utils
+from common.utils import sign_message
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -88,6 +93,19 @@ class AITradingBot:
 
     def execute_trades(self, decisions: list[dict]):
         """Executes the decisions via Pacifica SDK."""
+        if not self.pacifica_private_key:
+            logger.warning(f"Bot {self.bot_id} has no private key configured. Skipping execution.")
+            return
+
+        try:
+            keypair = Keypair.from_base58_string(self.pacifica_private_key)
+            public_key = str(keypair.pubkey())
+        except Exception as e:
+            logger.error(f"Invalid private key for Bot {self.bot_id}: {e}")
+            return
+
+        api_url = f"{PACIFICA_TESTNET_API}/orders/create_market"
+
         for decision in decisions:
             symbol = decision.get("symbol")
             action = decision.get("action")
@@ -99,9 +117,53 @@ class AITradingBot:
                 
             logger.info(f"Bot {self.bot_id} executing {action} for {amount} {symbol}. Reason: {decision.get('reason')}")
             
-            # Here we will integrate the Pacifica python-sdk `create_market_order` logic
-            # using self.pacifica_private_key to sign the transaction.
-            # ...
+            # Prepare Pacifica Signature
+            timestamp = int(time.time() * 1_000)
+            signature_header = {
+                "timestamp": timestamp,
+                "expiry_window": 5_000,
+                "type": "create_market_order",
+            }
+
+            # Map the action to a valid side ("bid" or "ask")
+            side = "bid" if action.lower() == "buy" else "ask"
+
+            signature_payload = {
+                "symbol": symbol.upper(),
+                "reduce_only": False,
+                "amount": str(amount),
+                "side": side,
+                "slippage_percent": "1.0", # Allow 1% slippage for market orders
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+            try:
+                # Sign the payload using the bot's dedicated subaccount keypair
+                message, signature = sign_message(signature_header, signature_payload, keypair)
+
+                request_header = {
+                    "account": public_key,
+                    "signature": signature,
+                    "timestamp": signature_header["timestamp"],
+                    "expiry_window": signature_header["expiry_window"],
+                }
+
+                headers = {"Content-Type": "application/json"}
+                request_payload = {
+                    **request_header,
+                    **signature_payload,
+                }
+
+                # Send POST to Pacifica Testnet
+                response = requests.post(api_url, json=request_payload, headers=headers)
+                
+                if response.status_code == 200:
+                    logger.info(f"Order Success: {response.text}")
+                else:
+                    logger.error(f"Order Failed ({response.status_code}): {response.text}")
+                    
+            except Exception as e:
+                logger.error(f"Exception executing trade for {symbol}: {e}")
             
     def run_cycle(self):
         """The main 5-minute loop function."""
