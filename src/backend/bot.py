@@ -165,9 +165,78 @@ class AITradingBot:
             except Exception as e:
                 logger.error(f"Exception executing trade for {symbol}: {e}")
             
-    def run_cycle(self):
+    def snapshot_performance(self, db_session):
+        """Fetches the account balance and unrealized PnL from Pacifica and saves to DB."""
+        if not self.pacifica_private_key:
+            return
+
+        try:
+            keypair = Keypair.from_base58_string(self.pacifica_private_key)
+            public_key = str(keypair.pubkey())
+        except Exception as e:
+            logger.error(f"Invalid private key for Bot {self.bot_id}: {e}")
+            return
+
+        api_url = f"{PACIFICA_TESTNET_API}/account"
+        
+        # Prepare Pacifica Signature
+        timestamp = int(time.time() * 1_000)
+        signature_header = {
+            "timestamp": timestamp,
+            "expiry_window": 5_000,
+            "type": "account_info",
+        }
+
+        try:
+            # We don't have a payload body for GET requests, so we sign an empty dict
+            message, signature = sign_message(signature_header, {}, keypair)
+            
+            headers = {
+                "account": public_key,
+                "signature": signature,
+                "timestamp": str(signature_header["timestamp"]),
+                "expiry_window": str(signature_header["expiry_window"]),
+            }
+
+            # Example GET to Pacifica (you'll need to confirm their exact endpoint)
+            response = requests.get(api_url, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json().get("data", {})
+                
+                # Extract metrics (these keys depend on the actual Pacifica Account response)
+                total_equity = float(data.get("account_value", 0))
+                cash_balance = float(data.get("account_cash_balance", 0))
+                unrealized_pnl = float(data.get("total_unrealized_pnl", 0))
+                
+                # Import here to avoid circular imports if any
+                from models import BotPerformanceSnapshot
+                
+                snapshot = BotPerformanceSnapshot(
+                    bot_id=self.bot_id,
+                    total_equity_usdc=total_equity,
+                    cash_balance=cash_balance,
+                    unrealized_pnl=unrealized_pnl,
+                    timestamp=datetime.utcnow()
+                )
+                
+                db_session.add(snapshot)
+                db_session.commit()
+                logger.info(f"Saved snapshot for Bot {self.bot_id}: Equity=${total_equity:.2f}")
+                
+            else:
+                logger.error(f"Failed to fetch account info: {response.text}")
+                
+        except Exception as e:
+            logger.error(f"Exception fetching performance snapshot for Bot {self.bot_id}: {e}")
+
+    def run_cycle(self, db_session):
         """The main 5-minute loop function."""
         logger.info(f"--- Starting loop cycle for Bot {self.bot_id} ---")
+        
+        # First, record the financial performance
+        self.snapshot_performance(db_session)
+        
         market_data = self.fetch_market_data()
         if not market_data:
             logger.warning("No market data fetched. Skipping cycle.")

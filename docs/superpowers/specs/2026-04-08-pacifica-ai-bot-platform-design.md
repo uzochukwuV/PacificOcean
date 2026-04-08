@@ -20,7 +20,22 @@ The platform allows users to launch or invest in AI-driven trading bots on the P
 - **Invest**: Users deposit USDC. The backend calls Pacifica's `/account/subaccount/transfer` to move the funds from the main platform treasury to the specific bot's subaccount.
 - **Launch a Bot**: Users can create a new bot by selecting a watchlist of pairs and providing a custom prompt/strategy to the AI.
 
-## 3. Data Flow (The 5-Minute Loop)
+## 3. Database Schema & Analytics
+To track user investments and render a "crypto-style" PnL chart on the frontend, the platform uses the following relational structure:
+
+### Models
+- **`Bot`**: `id`, `watchlist`, `created_at`, `pacifica_subaccount_pubkey`
+- **`User`**: `id` (Wallet Address), `created_at`
+- **`Investment`**: `id`, `user_id`, `bot_id`, `amount_usdc`, `status` (active/withdrawn), `timestamp`
+- **`BotPerformanceSnapshot`**: `id`, `bot_id`, `timestamp`, `total_equity_usdc`, `unrealized_pnl`
+
+### Analytics Engine (The Chart Data)
+1. **The Snapshot Loop**: Along with the 5-minute trading cycle, the backend polls the Pacifica API to get the exact `account_value` (Cash Balance + Unrealized PnL) for every active Bot's Subaccount.
+2. **Database Storage**: It saves this value as a `BotPerformanceSnapshot` with a timestamp. 
+3. **User Calculation**: When a user connects their wallet, the frontend requests `/users/{wallet}/analytics`. The backend looks up the user's `Investment` size relative to the Bot's total pool at the time of investment. It then multiplies that percentage by the latest `BotPerformanceSnapshot` to calculate the user's exact current value.
+4. **Frontend Chart**: The frontend uses a library like Recharts or TradingView Lightweight Charts to map the historical `BotPerformanceSnapshot` data into a smooth line chart, showing the bot's total equity over time.
+
+## 4. Data Flow (The 5-Minute Loop)
 1. **Trigger**: Scheduler wakes up every 5 minutes.
 2. **Fetch Data**: For Bot A (trades BTC, SOL), fetch 15m/1h klines and current order book depth from Pacifica API.
 3. **Analyze**: Format data as text: "Current BTC price is X, last 5 candles were [...]. You have $Y in USDC. What is your move?". Send to OpenRouter.
