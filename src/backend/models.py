@@ -22,6 +22,9 @@ class Bot(Base):
     watchlist = Column(String) # JSON string of pairs: '["BTC", "ETH"]'
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
+    
+    # Internal Accounting (Uniswap style LP shares)
+    total_shares = Column(Float, default=0.0)
 
     # Relationships
     investments = relationship("Investment", back_populates="bot")

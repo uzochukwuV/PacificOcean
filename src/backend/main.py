@@ -125,7 +125,113 @@ def get_user_portfolio(wallet_address: str, db: Session = Depends(get_db)):
         "total_value_usdc": total_portfolio_value,
         "investments": portfolio
     }
-def launch_bot(bot_id: str, watchlist: list[str]):
+from pydantic import BaseModel
+
+class DepositRequest(BaseModel):
+    wallet_address: str
+    amount_usdc: float
+
+@app.post("/bots/{bot_id}/deposit")
+def deposit_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_db)):
+    """
+    Simulates a user depositing USDC into a Bot's pool.
+    Uses Uniswap V2 style LP share minting to accurately track ownership.
+    """
+    bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    # Ensure user exists
+    user = db.query(models.User).filter(models.User.wallet_address == req.wallet_address).first()
+    if not user:
+        user = models.User(wallet_address=req.wallet_address)
+        db.add(user)
+        db.commit()
+
+    # Step 1: Get the current total equity of the Bot (Cash + Unrealized PnL)
+    latest_snapshot = db.query(models.BotPerformanceSnapshot).filter(
+        models.BotPerformanceSnapshot.bot_id == bot_id
+    ).order_by(models.BotPerformanceSnapshot.timestamp.desc()).first()
+
+    current_equity = latest_snapshot.total_equity_usdc if latest_snapshot else 0.0
+
+    # Step 2: Calculate how many 'Shares' (LP Tokens) to mint for this deposit
+    # If the bot is brand new (equity = 0), 1 USDC = 1 Share
+    # Else, Shares to Mint = (Deposit Amount / Current Equity) * Total Existing Shares
+    if bot.total_shares == 0 or current_equity == 0:
+        shares_to_mint = req.amount_usdc
+    else:
+        shares_to_mint = (req.amount_usdc / current_equity) * bot.total_shares
+
+    # Step 3: Record the investment and update the Bot's total shares
+    bot.total_shares += shares_to_mint
+
+    investment = models.Investment(
+        user_id=req.wallet_address,
+        bot_id=bot_id,
+        amount_usdc=req.amount_usdc,
+        shares=shares_to_mint,
+        status="active"
+    )
+    
+    db.add(investment)
+    db.commit()
+
+    # In a real scenario, here we would call Pacifica python-sdk to actually transfer 
+    # the user's deposited USDC from the main treasury to the Bot's Subaccount.
+    # transfer_funds(to_account=bot.pacifica_subaccount_pubkey, amount=req.amount_usdc)
+
+    return {
+        "status": "success",
+        "message": f"Deposited {req.amount_usdc} USDC",
+        "shares_received": shares_to_mint,
+        "bot_total_shares": bot.total_shares
+    }
+
+@app.post("/bots/{bot_id}/withdraw")
+def withdraw_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_db)):
+    """
+    Simulates a user withdrawing their share of the Bot's pool.
+    """
+    # For simplicity, we assume they are withdrawing ALL their active shares in this bot.
+    investments = db.query(models.Investment).filter(
+        models.Investment.bot_id == bot_id,
+        models.Investment.user_id == req.wallet_address,
+        models.Investment.status == "active"
+    ).all()
+
+    if not investments:
+        raise HTTPException(status_code=400, detail="No active investments found")
+
+    user_total_shares = sum(inv.shares for inv in investments)
+
+    bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
+    latest_snapshot = db.query(models.BotPerformanceSnapshot).filter(
+        models.BotPerformanceSnapshot.bot_id == bot_id
+    ).order_by(models.BotPerformanceSnapshot.timestamp.desc()).first()
+
+    current_equity = latest_snapshot.total_equity_usdc if latest_snapshot else 0.0
+
+    # Calculate USDC value of their shares
+    if bot.total_shares == 0:
+        withdrawal_value = 0
+    else:
+        withdrawal_value = (user_total_shares / bot.total_shares) * current_equity
+
+    # Burn the shares
+    bot.total_shares -= user_total_shares
+    
+    for inv in investments:
+        inv.status = "withdrawn"
+
+    db.commit()
+
+    # In reality, call Pacifica python-sdk to transfer from Subaccount -> User Wallet
+    return {
+        "status": "success",
+        "withdrawn_usdc": withdrawal_value,
+        "shares_burned": user_total_shares
+    }
     """Endpoint to launch a new AI bot."""
     if bot_id in active_bots:
         return {"error": "Bot already exists"}
