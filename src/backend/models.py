@@ -17,9 +17,15 @@ class Bot(Base):
     __tablename__ = "bots"
 
     id = Column(String, primary_key=True, index=True) # E.g., bot_001
+    name = Column(String, default="Unnamed Bot") # e.g. "Solana Maxi Bot"
     creator_address = Column(String, ForeignKey("users.wallet_address"))
     pacifica_subaccount_pubkey = Column(String, unique=True, index=True) # The public key on Pacifica holding funds
+    
+    # User-defined No-Code Configuration
     watchlist = Column(String) # JSON string of pairs: '["BTC", "ETH"]'
+    risk_level = Column(String, default="medium") # "low", "medium", "high"
+    strategy_prompt = Column(String) # User's custom instructions for the LLM
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     

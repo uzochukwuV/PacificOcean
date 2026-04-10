@@ -3,6 +3,8 @@ import logging
 import requests
 import time
 import uuid
+import pandas as pd
+import pandas_ta as ta
 from openai import OpenAI
 from datetime import datetime
 from solders.keypair import Keypair
@@ -16,55 +18,94 @@ logger = logging.getLogger(__name__)
 
 # Constants
 PACIFICA_TESTNET_API = "https://test-api.pacifica.fi/api/v1"
-# We will need the Pacifica python-sdk helper functions here later
 
 class AITradingBot:
-    def __init__(self, bot_id: str, openrouter_api_key: str, pacifica_private_key: str, watchlist: list[str]):
+    def __init__(self, bot_id: str, openrouter_api_key: str, pacifica_private_key: str, watchlist: list[str], strategy_prompt: str = "", risk_level: str = "medium"):
         self.bot_id = bot_id
         self.watchlist = watchlist
         self.pacifica_private_key = pacifica_private_key
+        self.strategy_prompt = strategy_prompt
+        self.risk_level = risk_level
         
-        # Initialize OpenRouter client (compatible with OpenAI SDK)
+        # Initialize OpenRouter client
         self.llm_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=openrouter_api_key,
         )
 
+    def calculate_technical_indicators(self, df: pd.DataFrame) -> dict:
+        """Applies pandas-ta to calculate RSI and MACD for the LLM."""
+        if df.empty or len(df) < 20:
+            return {}
+            
+        # Calculate RSI (14 period)
+        df.ta.rsi(length=14, append=True)
+        # Calculate MACD
+        df.ta.macd(fast=12, slow=26, signal=9, append=True)
+        
+        # Extract the latest values
+        latest = df.iloc[-1]
+        
+        # Ensure column names match pandas-ta output format
+        rsi_col = [col for col in df.columns if 'RSI' in col]
+        macd_col = [col for col in df.columns if 'MACD_' in col]
+        
+        return {
+            "current_price": float(latest['close']),
+            "RSI_14": float(latest[rsi_col[0]]) if rsi_col else None,
+            "MACD": float(latest[macd_col[0]]) if macd_col else None,
+            "recent_volume": float(latest['volume'])
+        }
+
     def fetch_market_data(self) -> dict:
-        """Fetches recent klines/candles for the bot's watchlist from Pacifica."""
+        """Fetches recent klines/candles and calculates technical indicators."""
         market_data = {}
         for symbol in self.watchlist:
             try:
-                # Assuming Pacifica has a standard klines endpoint
-                # In a real scenario, you'd check their exact endpoint path for klines
-                # e.g., /klines?symbol=BTC&interval=5m
-                logger.info(f"Fetching data for {symbol}...")
+                logger.info(f"Fetching data and calculating indicators for {symbol}...")
                 
-                # Mock data for now since we need to verify the exact Pacifica kline endpoint
-                market_data[symbol] = {
-                    "current_price": 65000 if symbol == "BTC" else 3000,
-                    "trend": "bullish",
-                    "recent_volume": "high"
-                }
+                # Mocking the Pacifica Kline data structure for now
+                # Usually: [timestamp, open, high, low, close, volume]
+                # To calculate RSI, we need at least 15-20 candles
+                mock_klines = [
+                    {"time": time.time() - (i*300), "open": 65000 + i, "high": 65100, "low": 64900, "close": 65050 - (i*10), "volume": 100}
+                    for i in range(30, 0, -1)
+                ]
+                
+                # Convert to Pandas DataFrame for Technical Analysis
+                df = pd.DataFrame(mock_klines)
+                
+                # Calculate the exact indicator numbers for the LLM
+                indicators = self.calculate_technical_indicators(df)
+                
+                if indicators:
+                    market_data[symbol] = indicators
+                
             except Exception as e:
                 logger.error(f"Error fetching data for {symbol}: {e}")
         return market_data
 
     def analyze_and_decide(self, market_data: dict) -> list[dict]:
-        """Sends market data to LLM and gets trading decisions."""
-        system_prompt = """
+        """Sends technical data to LLM with the user's custom prompt."""
+        system_prompt = f"""
         You are an expert AI trading bot. You manage a portfolio of crypto assets.
-        Given the current market data, output your trading decisions in valid JSON format.
+        
+        USER'S CUSTOM STRATEGY:
+        "{self.strategy_prompt if self.strategy_prompt else 'Trade profitably and safely.'}"
+        
+        RISK LEVEL: {self.risk_level.upper()}
+        - If LOW: Only trade on extremely strong signals (e.g. RSI < 30 for buy).
+        - If HIGH: Trade aggressively on small momentum shifts.
+        
+        Given the current market data and technical indicators (RSI, MACD), output your trading decisions in valid JSON format.
         Your response MUST be a list of objects, each containing:
         - "symbol": The asset symbol (e.g. "BTC")
         - "action": "buy", "sell", or "hold"
         - "amount": The amount to trade (as a string)
-        - "reason": A short explanation for the decision
-        
-        Example: [{"symbol": "BTC", "action": "buy", "amount": "0.1", "reason": "strong volume breakout"}]
+        - "reason": A short explanation referencing the RSI/MACD.
         """
         
-        user_prompt = f"Current Market Data: {json.dumps(market_data)}\nWhat are your trades for the next 5 minutes?"
+        user_prompt = f"Market Data & Indicators: {json.dumps(market_data)}\nWhat are your trades for the next 5 minutes?"
         
         try:
             response = self.llm_client.chat.completions.create(

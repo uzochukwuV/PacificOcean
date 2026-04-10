@@ -232,19 +232,55 @@ def withdraw_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_d
         "withdrawn_usdc": withdrawal_value,
         "shares_burned": user_total_shares
     }
-    """Endpoint to launch a new AI bot."""
-    if bot_id in active_bots:
-        return {"error": "Bot already exists"}
-        
-    test_key = os.getenv("OPENROUTER_API_KEY")
-    pacifica_key = os.getenv("PACIFICA_PRIVATE_KEY") # In a real app, this would be a dynamically generated subaccount key
+class LaunchBotRequest(BaseModel):
+    wallet_address: str
+    bot_name: str
+    watchlist: list[str]
+    risk_level: str = "medium"
+    strategy_prompt: str = ""
+
+@app.post("/bots/launch")
+def launch_bot(req: LaunchBotRequest, db: Session = Depends(get_db)):
+    """Endpoint to launch a new AI bot via No-Code Form."""
+    import uuid
+    bot_id = f"bot_{str(uuid.uuid4())[:8]}"
     
+    # Ensure user exists
+    user = db.query(models.User).filter(models.User.wallet_address == req.wallet_address).first()
+    if not user:
+        user = models.User(wallet_address=req.wallet_address)
+        db.add(user)
+        db.commit()
+
+    test_key = os.getenv("OPENROUTER_API_KEY")
+    pacifica_key = os.getenv("PACIFICA_PRIVATE_KEY") # Real app: generate a new Ed25519 keypair here
+    
+    # Save bot to DB
+    new_bot = models.Bot(
+        id=bot_id,
+        name=req.bot_name,
+        creator_address=req.wallet_address,
+        pacifica_subaccount_pubkey="generated_pubkey_placeholder", 
+        watchlist=str(req.watchlist),
+        risk_level=req.risk_level,
+        strategy_prompt=req.strategy_prompt
+    )
+    db.add(new_bot)
+    db.commit()
+    
+    # Instantiate bot in memory
     bot = AITradingBot(
         bot_id=bot_id,
         openrouter_api_key=test_key,
         pacifica_private_key=pacifica_key,
-        watchlist=watchlist
+        watchlist=req.watchlist,
+        strategy_prompt=req.strategy_prompt,
+        risk_level=req.risk_level
     )
     active_bots[bot_id] = bot
     
-    return {"status": "success", "message": f"Bot {bot_id} launched tracking {watchlist}"}
+    return {
+        "status": "success", 
+        "message": f"Bot '{req.bot_name}' ({bot_id}) launched successfully!",
+        "bot_id": bot_id
+    }
