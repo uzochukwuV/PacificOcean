@@ -79,7 +79,8 @@ def start_scheduler():
 
 @app.on_event("shutdown")
 def stop_scheduler():
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 
 @app.get("/")
 def read_root():
@@ -139,6 +140,18 @@ def get_bot_analytics(bot_id: str, db: Session = Depends(get_db)):
             } for snap in snapshots
         ]
     }
+
+@app.get("/bots/{bot_id}/account-summary")
+def get_bot_account_summary(bot_id: str):
+    """Return Pacifica-backed account and open position details for a bot."""
+    bot = active_bots.get(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    try:
+        return bot.get_account_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch account summary: {e}")
 
 @app.get("/users/{wallet_address}/portfolio")
 def get_user_portfolio(wallet_address: str, db: Session = Depends(get_db)):

@@ -3,6 +3,7 @@ import logging
 import requests
 import time
 import uuid
+from pathlib import Path
 from openai import OpenAI
 from datetime import datetime
 from solders.keypair import Keypair
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Constants
 PACIFICA_TESTNET_API = "https://test-api.pacifica.fi/api/v1"
 # We will need the Pacifica python-sdk helper functions here later
+PROMPT_LOG_DIR = Path(__file__).resolve().parent / "prompt_logs"
 
 
 def extract_json_block(content: str) -> str:
@@ -39,6 +41,38 @@ def extract_json_block(content: str) -> str:
         return cleaned[start:end]
 
     return cleaned
+
+
+def write_prompt_log(provider: str, system_prompt: str, user_prompt: str) -> Path:
+    """Persist the exact prompts sent to the AI for debugging and audits."""
+    PROMPT_LOG_DIR.mkdir(exist_ok=True)
+
+    existing = sorted(PROMPT_LOG_DIR.glob("prompt_*.log"))
+    next_index = 1
+    if existing:
+        try:
+            next_index = max(int(path.stem.split("_")[1]) for path in existing) + 1
+        except Exception:
+            next_index = len(existing) + 1
+
+    log_path = PROMPT_LOG_DIR / f"prompt_{next_index}.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                f"timestamp: {datetime.utcnow().isoformat()}Z",
+                f"provider: {provider}",
+                "",
+                "=== SYSTEM PROMPT ===",
+                system_prompt.strip(),
+                "",
+                "=== USER PROMPT ===",
+                user_prompt.strip(),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return log_path
 
 class AITradingBot:
     def __init__(self, bot_id: str, openrouter_api_key: str, pacifica_private_key: str, watchlist: list[str], gemini_api_key: str = None, market_type: str = "both"):
@@ -64,6 +98,160 @@ class AITradingBot:
         self.risk_manager = RiskManager()
         self.last_scan_candidates = []
 
+    def _get_keypair_and_public_key(self):
+        """Build the Pacifica signing keypair and account public key."""
+        keypair = Keypair.from_base58_string(self.pacifica_private_key)
+        public_key = str(keypair.pubkey())
+        return keypair, public_key
+
+    def _signed_get(self, endpoint: str, request_type: str, payload: dict):
+        """Perform a signed Pacifica GET request."""
+        keypair, public_key = self._get_keypair_and_public_key()
+
+        timestamp = int(time.time() * 1_000)
+        signature_header = {
+            "timestamp": timestamp,
+            "expiry_window": 5_000,
+            "type": request_type,
+        }
+
+        _, signature = sign_message(signature_header, payload, keypair)
+        headers = {
+            "account": public_key,
+            "signature": signature,
+            "timestamp": str(signature_header["timestamp"]),
+            "expiry_window": str(signature_header["expiry_window"]),
+        }
+
+        response = requests.get(
+            f"{PACIFICA_TESTNET_API}{endpoint}",
+            params=payload,
+            headers=headers,
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_open_positions_context(self, db_session) -> list[dict]:
+        """Summarize currently open positions so the AI can reason about reversals."""
+        from models import Position
+
+        open_positions = db_session.query(Position).filter(
+            Position.bot_id == self.bot_id,
+            Position.status == "open"
+        ).all()
+
+        return [
+            {
+                "symbol": position.symbol,
+                "side": position.side,
+                "entry_price": round(position.entry_price, 6),
+                "position_size": round(position.position_size, 6),
+                "stop_loss": round(position.stop_loss, 6) if position.stop_loss is not None else None,
+                "take_profit": round(position.take_profit, 6) if position.take_profit is not None else None,
+                "opened_at": position.opened_at.isoformat() if position.opened_at else None,
+            }
+            for position in open_positions
+        ]
+
+    def get_account_summary(self) -> dict:
+        """Fetch a combined Pacifica account + positions + settings summary."""
+        if not self.pacifica_private_key:
+            return {
+                "bot_id": self.bot_id,
+                "account": None,
+                "summary": None,
+                "positions": [],
+                "spot_collateral": [],
+                "unsupported_fields": {
+                    "deposit_apy": None,
+                    "borrow_apy": None,
+                    "interest_earned": None,
+                    "interest_owed": None,
+                },
+                "note": "No Pacifica private key configured.",
+            }
+
+        keypair, public_key = self._get_keypair_and_public_key()
+        account_payload = {"account": public_key}
+
+        account_info = self._signed_get("/account", "account_info", account_payload).get("data", {})
+        positions = self._signed_get("/positions", "positions_info", account_payload).get("data", [])
+        settings = self._signed_get("/account/settings", "account_settings_info", account_payload).get("data", [])
+
+        account_balance = float(account_info.get("balance", 0))
+        account_equity = float(account_info.get("account_equity", account_balance))
+        unrealized_pnl = account_equity - account_balance
+
+        formatted_positions = []
+        for position in positions:
+            side = position.get("side")
+            amount = float(position.get("amount", 0))
+            entry_price = float(position.get("entry_price", 0))
+            current_price = self.market_analyzer.get_current_price(position.get("symbol")) or entry_price
+
+            if side == "bid":
+                pnl = (current_price - entry_price) * amount
+            else:
+                pnl = (entry_price - current_price) * amount
+
+            setting = next((item for item in settings if item.get("symbol") == position.get("symbol")), None)
+
+            formatted_positions.append({
+                "symbol": position.get("symbol"),
+                "side": side,
+                "action": "LONG" if side == "bid" else "SHORT",
+                "amount": amount,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "estimated_pnl": round(pnl, 6),
+                "funding_paid": float(position.get("funding", 0)),
+                "isolated": bool(position.get("isolated", False)),
+                "margin": float(position.get("margin", 0) or 0),
+                "leverage": setting.get("leverage") if setting else None,
+                "updated_at": position.get("updated_at"),
+            })
+
+        return {
+            "bot_id": self.bot_id,
+            "account": public_key,
+            "summary": {
+                "usdc_balance": account_balance,
+                "account_equity": account_equity,
+                "unrealized_pnl": unrealized_pnl,
+                "available_to_spend": float(account_info.get("available_to_spend", 0)),
+                "available_to_withdraw": float(account_info.get("available_to_withdraw", 0)),
+                "pending_balance": float(account_info.get("pending_balance", 0)),
+                "total_margin_used": float(account_info.get("total_margin_used", 0)),
+                "cross_mmr": float(account_info.get("cross_mmr", 0)),
+                "fee_level": account_info.get("fee_level"),
+                "maker_fee": float(account_info.get("maker_fee", 0)),
+                "taker_fee": float(account_info.get("taker_fee", 0)),
+                "positions_count": account_info.get("positions_count", 0),
+                "orders_count": account_info.get("orders_count", 0),
+                "stop_orders_count": account_info.get("stop_orders_count", 0),
+            },
+            "positions": formatted_positions,
+            "spot_collateral": [
+                {
+                    "asset": "USDC",
+                    "balance": account_balance,
+                    "deposit_apy": None,
+                    "borrow_apy": None,
+                    "interest_earned": None,
+                    "interest_owed": None,
+                    "spot_collateral": 0,
+                }
+            ],
+            "unsupported_fields": {
+                "deposit_apy": None,
+                "borrow_apy": None,
+                "interest_earned": None,
+                "interest_owed": None,
+            },
+            "note": "Pacifica exposes perp account/position data here. Lending-style APY and interest fields are not available in the current Pacifica account APIs.",
+        }
+
     def scan_for_trade_candidates(
         self,
         symbols: list[str] | None = None,
@@ -71,7 +259,13 @@ class AITradingBot:
         min_confidence: int = 60,
     ) -> list[dict]:
         """Rank markets locally before sending the strongest ones to the AI."""
-        scan_universe = symbols or self.watchlist or DEFAULT_PERP_SCAN_SYMBOLS
+        scan_universe = symbols
+        if scan_universe is None:
+            if self.market_type in {"perp", "both"}:
+                scan_universe = self.market_analyzer.get_pacifica_markets()
+            else:
+                scan_universe = self.watchlist or DEFAULT_PERP_SCAN_SYMBOLS
+
         candidates = self.market_analyzer.scan_markets(scan_universe, min_confidence=min_confidence)
         self.last_scan_candidates = candidates[:limit]
 
@@ -104,7 +298,7 @@ class AITradingBot:
                 logger.error(f"Error fetching data for {symbol}: {e}")
         return market_data
 
-    def analyze_and_decide(self, market_data: dict) -> list[dict]:
+    def analyze_and_decide(self, market_data: dict, open_positions: list[dict] | None = None) -> list[dict]:
         """Sends market data to LLM and gets trading decisions."""
         # For demo purposes, if API key is a dummy, return mock decisions
         if "dummy" in self.llm_client.api_key or not self.llm_client.api_key:
@@ -142,19 +336,24 @@ class AITradingBot:
         - Don't overtrade - max 3-4 positions at once
 
         OUTPUT FORMAT (JSON list):
-        [{"symbol": "BTC", "action": "buy", "market": "perp", "risk_level": "medium", "confidence": 0.75, "reason": "RSI oversold at 28, bullish MACD crossover, price bounced off support. Using perp for leverage."},
-         {"symbol": "ETH", "action": "sell", "market": "perp", "risk_level": "low", "confidence": 0.65, "reason": "RSI overbought, resistance hit, MACD bearish. Shorting with perp."},
-         {"symbol": "PENGU", "action": "buy", "market": "spot", "risk_level": "high", "confidence": 0.5, "reason": "Strong uptrend but high volatility - using spot for safety"}]
+        [{"symbol": "BTC", "action": "buy", "market": "perp", "position_action": "open", "risk_level": "medium", "confidence": 0.75, "reason": "RSI oversold at 28, bullish MACD crossover, price bounced off support. Using perp for leverage."},
+         {"symbol": "ETH", "action": "sell", "market": "perp", "position_action": "reverse", "risk_level": "low", "confidence": 0.65, "reason": "Existing long should be reversed because RSI is overbought and MACD turned bearish."},
+         {"symbol": "PENGU", "action": "hold", "market": "perp", "position_action": "hold", "risk_level": "high", "confidence": 0.5, "reason": "Already in position and setup is not strong enough to change it."}]
 
         Fields:
         - symbol: Asset symbol
         - action: "buy" (LONG), "sell" (SHORT), or "hold"
         - market: "spot" or "perp" (CHOOSE WISELY: perp for leverage/shorting, spot for safety)
+        - position_action: "open", "add", "hold", "close", or "reverse"
         - risk_level: "low", "medium", "high"
         - confidence: 0.0 to 1.0 (ONLY trade if confidence > 0.6)
         - reason: Technical justification including why you chose spot/perp
 
         MARKET SELECTION RULES:
+        - You will be given current open positions. Use them.
+        - If there is an existing position in the opposite direction, prefer "reverse" or "close" instead of blindly opening the opposite side.
+        - If there is an existing position in the same direction, use "hold" or "add".
+        - If the current open trade should remain untouched, return "hold".
         - Use PERP when: Strong directional signal, want leverage, need to SHORT
         - Use SPOT when: Uncertain trend, high volatility, meme coins with weak signals
         - You can trade MULTIPLE assets simultaneously (2-4 positions)
@@ -193,11 +392,19 @@ class AITradingBot:
                 for item in self.last_scan_candidates
             ], indent=2)
 
-        user_prompt = f"""Market Analysis:
+        open_positions_context = json.dumps(open_positions or [], indent=2)
+
+        user_prompt = f"""Current Open Positions:
+{open_positions_context}
+
+Market Analysis:
 {json.dumps(formatted_data, indent=2)}
 {scan_context}
 
 Analyze each asset and provide trading decisions. Only suggest trades with strong technical signals."""
+
+        openrouter_prompt_log = write_prompt_log("openrouter", system_prompt, user_prompt)
+        logger.info(f"Saved OpenRouter prompt log to {openrouter_prompt_log}")
         
         # Try OpenRouter first
         try:
@@ -235,6 +442,8 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
                 try:
                     logger.info("Falling back to Gemini API...")
                     prompt = f"{system_prompt}\n\n{user_prompt}\n\nRespond with valid JSON only."
+                    gemini_prompt_log = write_prompt_log("gemini", system_prompt, f"{user_prompt}\n\nRespond with valid JSON only.")
+                    logger.info(f"Saved Gemini prompt log to {gemini_prompt_log}")
 
                     response = self.gemini_model.generate_content(
                         prompt,
@@ -268,7 +477,7 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
                 logger.warning("No fallback LLM configured")
                 return []
 
-    def execute_trades(self, decisions: list[dict], account_balance: float = 1000.0):
+    def execute_trades(self, decisions: list[dict], account_balance: float = 1000.0, db_session=None):
         """Executes trades with risk management for both spot and perp."""
         if not self.pacifica_private_key:
             logger.warning(f"Bot {self.bot_id} has no private key configured. Skipping execution.")
@@ -284,14 +493,14 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
         api_url = f"{PACIFICA_TESTNET_API}/orders/create_market"
         current_exposure = 0.0
 
-        # Perp-supported symbols
-        perp_symbols = {"BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "AVAX", "ARB", "ENA",
-                       "PENGU", "ZEC", "WIF", "BCH", "TON", "WLFI", "kBONK", "FARTCOIN", "PUMP", "MON"}
+        # Treat Pacifica /info as the source of truth for tradable perp markets.
+        perp_symbols = {symbol.upper() for symbol in self.market_analyzer.get_pacifica_markets()}
 
         for decision in decisions:
             symbol = decision.get("symbol")
             action = decision.get("action")
             market = decision.get("market", "spot")  # AI decides spot or perp
+            position_action = decision.get("position_action", "open")
             risk_level = decision.get("risk_level", "medium")
             confidence = decision.get("confidence", 0.5)
 
@@ -300,14 +509,51 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
                 logger.info(f"Bot {self.bot_id} skipping {symbol} - confidence too low ({confidence})")
                 continue
 
-            if action == "hold":
+            if action == "hold" or position_action == "hold":
                 logger.info(f"Bot {self.bot_id} holding {symbol}.")
                 continue
 
+            existing_positions = []
+            if db_session is not None:
+                from models import Position
+                existing_positions = db_session.query(Position).filter(
+                    Position.bot_id == self.bot_id,
+                    Position.symbol == symbol,
+                    Position.status == "open"
+                ).all()
+
+            same_side_position = next((pos for pos in existing_positions if pos.side == action), None)
+            opposite_side_position = next((pos for pos in existing_positions if pos.side != action), None)
+
+            if position_action == "close":
+                if opposite_side_position:
+                    logger.info(f"AI requested close for opposite {symbol} position before new trade decision.")
+                    self.close_position(opposite_side_position, opposite_side_position.entry_price, "AI close instruction", db_session)
+                elif same_side_position:
+                    logger.info(f"AI requested close for existing {symbol} position.")
+                    self.close_position(same_side_position, same_side_position.entry_price, "AI close instruction", db_session)
+                continue
+
+            if opposite_side_position and position_action != "reverse":
+                logger.warning(
+                    f"Skipping {symbol} {action} because an opposite position is open and AI did not explicitly request reverse."
+                )
+                continue
+
+            if same_side_position and position_action not in {"add", "reverse"}:
+                logger.info(f"Skipping duplicate same-side trade for {symbol}; AI did not request add.")
+                continue
+
+            if opposite_side_position and position_action == "reverse":
+                logger.info(f"Reversing {symbol}: closing existing {opposite_side_position.side} before opening {action}.")
+                self.close_position(opposite_side_position, opposite_side_position.entry_price, "AI reverse instruction", db_session)
+
             # Get current market price
             try:
-                entry_price = self.market_analyzer.exchange.fetch_ticker(f"{symbol}/USDT")['last']
-            except:
+                entry_price = self.market_analyzer.get_current_price(symbol)
+                if entry_price is None:
+                    raise ValueError("missing price")
+            except Exception:
                 logger.error(f"Could not fetch current price for {symbol}")
                 continue
 
@@ -386,7 +632,7 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
             stop_loss = self.risk_manager.calculate_stop_loss(entry_price, side)
             take_profit = self.risk_manager.calculate_take_profit(entry_price, side)
 
-            # Pacifica is perps-only, attach TP/SL directly to market order
+            # Submit a plain market order first. TP/SL can be set separately after fill.
             signature_payload = {
                 "symbol": symbol.upper(),
                 "reduce_only": False,
@@ -394,9 +640,6 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
                 "side": side,
                 "slippage_percent": slippage_pct,
                 "client_order_id": str(uuid.uuid4()),
-                # Attach TP/SL to the order itself
-                "take_profit_trigger_price": str(round(take_profit, 2)),
-                "stop_loss_trigger_price": str(round(stop_loss, 2)),
             }
 
             if use_perp:
@@ -404,7 +647,7 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
             else:
                 logger.info(f"Trading without leverage (perp with 1x effective)")
 
-            logger.info(f"TP/SL attached to order: SL @ ${stop_loss:.2f} | TP @ ${take_profit:.2f}")
+            logger.info(f"TP/SL calculated but not attached: SL @ ${stop_loss:.2f} | TP @ ${take_profit:.2f}")
 
             try:
                 message, signature = sign_message(signature_header, signature_payload, keypair)
@@ -426,7 +669,7 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
 
                 if response.status_code == 200:
                     result = response.json()
-                    logger.info(f"Order Success with TP/SL: {response.text}")
+                    logger.info(f"Order Success: {response.text}")
 
                     # TP/SL already attached to order above, just record position
                     from models import Position
@@ -536,6 +779,8 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
         # Check and manage open positions
         self.manage_open_positions(db_session)
 
+        open_positions = self.get_open_positions_context(db_session)
+
         candidates = self.scan_for_trade_candidates(limit=5, min_confidence=60)
         candidate_symbols = [item["symbol"] for item in candidates] or self.watchlist
 
@@ -544,10 +789,10 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
             logger.warning("No market data fetched. Skipping cycle.")
             return
 
-        decisions = self.analyze_and_decide(market_data)
+        decisions = self.analyze_and_decide(market_data, open_positions=open_positions)
         logger.info(f"AI Decisions: {json.dumps(decisions, indent=2)}")
 
-        self.execute_trades(decisions, account_balance)
+        self.execute_trades(decisions, account_balance, db_session=db_session)
         logger.info(f"--- Finished loop cycle for Bot {self.bot_id} ---")
 
     def manage_open_positions(self, db_session):
@@ -567,7 +812,9 @@ Analyze each asset and provide trading decisions. Only suggest trades with stron
         for position in open_positions:
             try:
                 # Get current price
-                current_price = self.market_analyzer.exchange.fetch_ticker(f"{position.symbol}/USDT")['last']
+                current_price = self.market_analyzer.get_current_price(position.symbol)
+                if current_price is None:
+                    raise ValueError("missing price")
 
                 # Check if should close
                 should_close = self.risk_manager.should_close_position(

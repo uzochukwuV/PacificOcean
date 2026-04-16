@@ -22,6 +22,19 @@ class MarketAnalyzer:
         self._prices_cache: dict[str, dict] = {}
         self._prices_cache_ts = 0.0
 
+    def _log_kline_preview(self, symbol: str, data) -> None:
+        """Log a small preview of Pacifica kline payload for debugging."""
+        try:
+            preview = data[:2] if isinstance(data, list) else data
+            logger.info(
+                "Pacifica kline preview for %s: count=%s preview=%s",
+                symbol,
+                len(data) if isinstance(data, list) else "n/a",
+                preview,
+            )
+        except Exception:
+            logger.info("Pacifica kline preview for %s unavailable", symbol)
+
     def get_pacifica_markets(self, cache_ttl: int = 300) -> List[str]:
         """Fetch Pacifica tradable markets from /info."""
         now = time.time()
@@ -62,9 +75,6 @@ class MarketAnalyzer:
 
     def get_symbol_market_specs(self, symbol: str) -> Dict | None:
         """Get Pacifica specs for a single market."""
-        for market in self.get_pacifica_markets():
-            if market == symbol:
-                break
         try:
             response = requests.get(f"{PACIFICA_TESTNET_API}/info", timeout=20)
             response.raise_for_status()
@@ -75,6 +85,25 @@ class MarketAnalyzer:
         except Exception:
             return None
         return None
+
+    def get_current_price(self, symbol: str) -> float | None:
+        """Get current price from Pacifica /info/prices, fallback to Binance."""
+        prices = self.get_pacifica_prices()
+        if symbol in prices:
+            item = prices[symbol]
+            for key in ("price", "mark_price", "oracle_price", "last_price"):
+                value = item.get(key)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        continue
+
+        try:
+            ticker = self.exchange.fetch_ticker(f"{symbol}/USDT")
+            return float(ticker["last"])
+        except Exception:
+            return None
 
     def fetch_ohlcv(self, symbol: str, timeframe: str = '5m', limit: int = 100) -> pd.DataFrame:
         """Fetch OHLCV data from Pacifica, with Binance as fallback."""
@@ -107,9 +136,15 @@ class MarketAnalyzer:
                 timeout=20,
             )
             response.raise_for_status()
-            data = response.json().get("data", [])
+            payload = response.json()
+            data = payload.get("data", [])
+
+            if not isinstance(data, list):
+                logger.warning("Unexpected Pacifica kline shape for %s: %s", symbol, payload)
+                data = []
 
             if data:
+                self._log_kline_preview(symbol, data)
                 rows = [
                     [
                         candle["t"],
@@ -123,7 +158,16 @@ class MarketAnalyzer:
                 ]
                 df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                return df
+                if len(df) >= 30:
+                    return df
+
+                logger.warning(
+                    "Pacifica returned too few klines for %s: got %s rows, need at least 30. Falling back.",
+                    symbol,
+                    len(df),
+                )
+            else:
+                logger.warning("Pacifica returned no kline rows for %s", symbol)
         except Exception as e:
             logger.warning(f"Pacifica OHLCV fetch failed for {symbol}, trying Binance fallback: {e}")
 
@@ -132,6 +176,7 @@ class MarketAnalyzer:
             ohlcv = self.exchange.fetch_ohlcv(trading_pair, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            logger.info("Using Binance fallback OHLCV for %s with %s rows", symbol, len(df))
             return df
         except Exception as e:
             logger.error(f"Error fetching OHLCV for {symbol}: {e}")
