@@ -170,11 +170,7 @@ class AITradingBot:
                 }
 
                 # Send POST to Pacifica Testnet
-                # response = requests.post(api_url, json=request_payload, headers=headers)
-                class MockPostResponse:
-                    status_code = 200
-                    text = "Mock order successful"
-                response = MockPostResponse()
+                response = requests.post(api_url, json=request_payload, headers=headers)
                 
                 if response.status_code == 200:
                     logger.info(f"Order Success: {response.text}")
@@ -218,18 +214,7 @@ class AITradingBot:
             }
 
             # Example GET to Pacifica (you'll need to confirm their exact endpoint)
-            # response = requests.get(api_url, headers=headers)
-            # Mocking response for demo
-            class MockResponse:
-                status_code = 200
-                def json(self):
-                    import random
-                    return {"data": {
-                        "account_value": 10000.0 + random.uniform(-100, 500),
-                        "account_cash_balance": 8000.0,
-                        "total_unrealized_pnl": random.uniform(-50, 200)
-                    }}
-            response = MockResponse()
+            response = requests.get(api_url, headers=headers)
             
             if response.status_code == 200:
                 data = response.json().get("data", {})
