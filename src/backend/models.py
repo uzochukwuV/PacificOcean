@@ -51,7 +51,7 @@ class BotPerformanceSnapshot(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     bot_id = Column(String, ForeignKey("bots.id"), index=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    
+
     # Metrics from Pacifica Account Info
     total_equity_usdc = Column(Float, nullable=False) # Cash Balance + Unrealized PnL
     unrealized_pnl = Column(Float, nullable=False)
@@ -59,3 +59,21 @@ class BotPerformanceSnapshot(Base):
 
     # Relationships
     bot = relationship("Bot", back_populates="performance_snapshots")
+
+class Position(Base):
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    bot_id = Column(String, ForeignKey("bots.id"), index=True)
+    symbol = Column(String, nullable=False)
+    side = Column(String, nullable=False)  # "buy" or "sell"
+    entry_price = Column(Float, nullable=False)
+    position_size = Column(Float, nullable=False)
+    stop_loss = Column(Float, nullable=True)
+    take_profit = Column(Float, nullable=True)
+    pacifica_order_id = Column(String, nullable=True)
+    status = Column(String, default="open")  # "open" or "closed"
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)

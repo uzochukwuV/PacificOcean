@@ -8,3 +8,8 @@ apscheduler
 openai
 solders
 base58
+google-generativeai
+pandas
+numpy
+ta-lib
+ccxt

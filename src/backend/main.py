@@ -1,10 +1,12 @@
 import os
+from threading import Lock
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from bot import AITradingBot
+from market_analysis import DEFAULT_PERP_SCAN_SYMBOLS
 import models
 from database import engine, get_db
 
@@ -18,9 +20,14 @@ app = FastAPI(title="Pacifica AI Bot Platform API")
 # Store active bot instances
 active_bots = {}
 scheduler = BackgroundScheduler()
+cycle_lock = Lock()
 
 def run_bot_cycles():
     """Iterate through all active bots and run their 5-minute cycle."""
+    if not cycle_lock.acquire(blocking=False):
+        print("Skipping bot cycle because another cycle is already running.")
+        return
+
     print("Running cycles for all active bots...")
     
     # Get a new DB session specifically for this background job
@@ -35,22 +42,26 @@ def run_bot_cycles():
                 print(f"Error running cycle for bot {bot_id}: {e}")
     finally:
         db.close()
+        cycle_lock.release()
 
 @app.on_event("startup")
 def start_scheduler():
     # Start the 5 minute loop
-    scheduler.add_job(run_bot_cycles, 'interval', minutes=5)
+    scheduler.add_job(run_bot_cycles, 'interval', minutes=5, max_instances=1, coalesce=True)
     scheduler.start()
     
     # Optional: Start a default test bot if env vars are set
     test_key = os.getenv("OPENROUTER_API_KEY")
     pacifica_key = os.getenv("PACIFICA_PRIVATE_KEY")
+    gemini_key = os.getenv("GEMINI_API_KEY")
     if test_key and pacifica_key:
         bot = AITradingBot(
             bot_id="bot_001",
             openrouter_api_key=test_key,
             pacifica_private_key=pacifica_key,
-            watchlist=["BTC", "ETH", "SOL"]
+            watchlist=DEFAULT_PERP_SCAN_SYMBOLS,
+            gemini_api_key=gemini_key,
+            market_type="both"  # "spot", "perp", or "both"
         )
         active_bots["bot_001"] = bot
         
@@ -77,8 +88,35 @@ def read_root():
 @app.post("/test/run_cycles")
 def trigger_cycles():
     """Manually trigger bot cycles for demo purposes."""
+    if cycle_lock.locked():
+        return {"status": "busy", "message": "A bot cycle is already running"}
+
     run_bot_cycles()
     return {"status": "success", "message": "Bot cycles triggered"}
+
+@app.get("/bots/{bot_id}/scan")
+def get_bot_scan(bot_id: str, limit: int = 5, min_confidence: int = 60):
+    """Inspect the bot's latest market scan candidates."""
+    bot = active_bots.get(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    candidates = bot.scan_for_trade_candidates(limit=limit, min_confidence=min_confidence)
+    return {
+        "bot_id": bot_id,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "symbol": item["symbol"],
+                "signal": item["signal"],
+                "confidence": item["confidence"],
+                "direction": item["direction"],
+                "score": item["score"],
+                "reason": item["reason"],
+            }
+            for item in candidates
+        ],
+    }
 
 @app.get("/bots/{bot_id}/analytics")
 def get_bot_analytics(bot_id: str, db: Session = Depends(get_db)):
@@ -250,28 +288,35 @@ def withdraw_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_d
         "shares_burned": user_total_shares
     }
 
+class LaunchBotRequest(BaseModel):
+    watchlist: list[str]
+    market_type: str = "both"  # "spot", "perp", or "both"
+
 @app.post("/bots/{bot_id}/launch")
-def launch_bot(bot_id: str, watchlist: list[str], db: Session = Depends(get_db)):
+def launch_bot(bot_id: str, req: LaunchBotRequest, db: Session = Depends(get_db)):
     """Endpoint to launch a new AI bot."""
     if bot_id in active_bots:
         return {"error": "Bot already exists"}
-        
+
     test_key = os.getenv("OPENROUTER_API_KEY")
     pacifica_key = os.getenv("PACIFICA_PRIVATE_KEY") # In a real app, this would be a dynamically generated subaccount key
-    
+    gemini_key = os.getenv("GEMINI_API_KEY")
+
     bot = AITradingBot(
         bot_id=bot_id,
         openrouter_api_key=test_key,
         pacifica_private_key=pacifica_key,
-        watchlist=watchlist
+        watchlist=req.watchlist,
+        gemini_api_key=gemini_key,
+        market_type=req.market_type
     )
     active_bots[bot_id] = bot
     
     import json
     db_bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
     if not db_bot:
-        db_bot = models.Bot(id=bot_id, watchlist=json.dumps(watchlist), pacifica_subaccount_pubkey=f"pubkey_{bot_id}")
+        db_bot = models.Bot(id=bot_id, watchlist=json.dumps(req.watchlist), pacifica_subaccount_pubkey=f"pubkey_{bot_id}")
         db.add(db_bot)
         db.commit()
-    
-    return {"status": "success", "message": f"Bot {bot_id} launched tracking {watchlist}"}
+
+    return {"status": "success", "message": f"Bot {bot_id} launched tracking {req.watchlist} on {req.market_type} markets"}
