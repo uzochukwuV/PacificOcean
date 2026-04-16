@@ -53,6 +53,17 @@ def start_scheduler():
             watchlist=["BTC", "ETH", "SOL"]
         )
         active_bots["bot_001"] = bot
+        
+        # Ensure bot is in DB
+        from database import SessionLocal
+        import json
+        db = SessionLocal()
+        db_bot = db.query(models.Bot).filter(models.Bot.id == "bot_001").first()
+        if not db_bot:
+            db_bot = models.Bot(id="bot_001", watchlist=json.dumps(["BTC", "ETH", "SOL"]), pacifica_subaccount_pubkey="default_pubkey")
+            db.add(db_bot)
+            db.commit()
+        db.close()
         print("Started default bot bot_001")
 
 @app.on_event("shutdown")
@@ -62,6 +73,12 @@ def stop_scheduler():
 @app.get("/")
 def read_root():
     return {"status": "ok", "active_bots": len(active_bots)}
+
+@app.post("/test/run_cycles")
+def trigger_cycles():
+    """Manually trigger bot cycles for demo purposes."""
+    run_bot_cycles()
+    return {"status": "success", "message": "Bot cycles triggered"}
 
 @app.get("/bots/{bot_id}/analytics")
 def get_bot_analytics(bot_id: str, db: Session = Depends(get_db)):
@@ -232,6 +249,9 @@ def withdraw_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_d
         "withdrawn_usdc": withdrawal_value,
         "shares_burned": user_total_shares
     }
+
+@app.post("/bots/{bot_id}/launch")
+def launch_bot(bot_id: str, watchlist: list[str], db: Session = Depends(get_db)):
     """Endpoint to launch a new AI bot."""
     if bot_id in active_bots:
         return {"error": "Bot already exists"}
@@ -246,5 +266,12 @@ def withdraw_funds(bot_id: str, req: DepositRequest, db: Session = Depends(get_d
         watchlist=watchlist
     )
     active_bots[bot_id] = bot
+    
+    import json
+    db_bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
+    if not db_bot:
+        db_bot = models.Bot(id=bot_id, watchlist=json.dumps(watchlist), pacifica_subaccount_pubkey=f"pubkey_{bot_id}")
+        db.add(db_bot)
+        db.commit()
     
     return {"status": "success", "message": f"Bot {bot_id} launched tracking {watchlist}"}
