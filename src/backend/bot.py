@@ -83,7 +83,7 @@ class AITradingBot:
         
         try:
             response = self.llm_client.chat.completions.create(
-                model="deepseek/deepseek-chat:free", # Using a free model since account has low credits
+                model="cognitivecomputations/dolphin3.0-r1-mistral-24b:free", # Using a free model since account has low credits
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
