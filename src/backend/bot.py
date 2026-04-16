@@ -83,11 +83,12 @@ class AITradingBot:
         
         try:
             response = self.llm_client.chat.completions.create(
-                model="openai/gpt-4-turbo-preview", # Can use cheaper models like claude-3-haiku or mistral
+                model="deepseek/deepseek-chat:free", # Using a free model since account has low credits
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
+                max_tokens=200,
                 response_format={ "type": "json_object" } # Force JSON output
             )
             
@@ -203,8 +204,9 @@ class AITradingBot:
         }
 
         try:
-            # We don't have a payload body for GET requests, so we sign an empty dict
-            message, signature = sign_message(signature_header, {}, keypair)
+            # Pacifica requires GET parameters to be included in the signed payload
+            payload = {"account": public_key}
+            message, signature = sign_message(signature_header, payload, keypair)
             
             headers = {
                 "account": public_key,
@@ -213,7 +215,8 @@ class AITradingBot:
                 "expiry_window": str(signature_header["expiry_window"]),
             }
 
-            # Example GET to Pacifica (you'll need to confirm their exact endpoint)
+            api_url = f"{PACIFICA_TESTNET_API}/account?account={public_key}"
+            
             response = requests.get(api_url, headers=headers)
             
             if response.status_code == 200:
