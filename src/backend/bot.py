@@ -52,6 +52,21 @@ class AITradingBot:
 
     def analyze_and_decide(self, market_data: dict) -> list[dict]:
         """Sends market data to LLM and gets trading decisions."""
+        # For demo purposes, if API key is a dummy, return mock decisions
+        if "dummy" in self.llm_client.api_key or not self.llm_client.api_key:
+            import random
+            decisions = []
+            for symbol in self.watchlist:
+                action = random.choice(["buy", "sell", "hold"])
+                if action != "hold":
+                    decisions.append({
+                        "symbol": symbol,
+                        "action": action,
+                        "amount": str(round(random.uniform(0.1, 1.0), 2)),
+                        "reason": f"Mock {action} signal detected in 5m klines"
+                    })
+            return decisions
+
         system_prompt = """
         You are an expert AI trading bot. You manage a portfolio of crypto assets.
         Given the current market data, output your trading decisions in valid JSON format.
@@ -68,11 +83,12 @@ class AITradingBot:
         
         try:
             response = self.llm_client.chat.completions.create(
-                model="openai/gpt-4-turbo-preview", # Can use cheaper models like claude-3-haiku or mistral
+                model="cognitivecomputations/dolphin3.0-r1-mistral-24b:free", # Using a free model since account has low credits
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
+                max_tokens=200,
                 response_format={ "type": "json_object" } # Force JSON output
             )
             
@@ -188,8 +204,9 @@ class AITradingBot:
         }
 
         try:
-            # We don't have a payload body for GET requests, so we sign an empty dict
-            message, signature = sign_message(signature_header, {}, keypair)
+            # Pacifica requires GET parameters to be included in the signed payload
+            payload = {"account": public_key}
+            message, signature = sign_message(signature_header, payload, keypair)
             
             headers = {
                 "account": public_key,
@@ -198,7 +215,8 @@ class AITradingBot:
                 "expiry_window": str(signature_header["expiry_window"]),
             }
 
-            # Example GET to Pacifica (you'll need to confirm their exact endpoint)
+            api_url = f"{PACIFICA_TESTNET_API}/account?account={public_key}"
+            
             response = requests.get(api_url, headers=headers)
             
             if response.status_code == 200:
